@@ -35,15 +35,39 @@ func startTestServer(t *testing.T, cfg Config) (addr string, shutdown func()) {
 	done := make(chan error, 1)
 	go func() { done <- s.ListenAndServe(ctx, boundAddr) }()
 
-	// Wait until the server starts to accept connections.
+	// Wait until the server starts to accept connections. A PING
+	// round-trip, not just a successful Dial, proves the server's
+	// Accept loop actually dequeued this connection and ran
+	// acquireSlot for it: a successful Dial only proves the kernel
+	// completed the TCP handshake, which can happen before the
+	// server's Accept call ever runs.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", boundAddr, 50*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
+		if err != nil {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		w := resp.NewWriter(conn)
+		r := resp.NewReader(conn)
+		writeErr := w.Write(resp.NewArray([]resp.Value{resp.NewBulkString("PING")}))
+		_, readErr := r.Read()
+		_ = conn.Close()
+		if writeErr == nil && readErr == nil {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Wait until the server has released this probe connection's slot.
+	// Without this, a test with a small MaxConnections can see the
+	// probe connection still counted as active and reject the test's
+	// own first connection instead of accepting it.
+	for time.Now().Before(deadline) {
+		if s.active.Load() == 0 {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
 	}
 
 	shutdown = func() {
