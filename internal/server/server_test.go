@@ -157,15 +157,27 @@ func TestServerRejectsConnectionsOverMaxConnections(t *testing.T) {
 	addr, shutdown := startTestServer(t, cfg)
 	defer shutdown()
 
-	// Keep the one allowed connection slot open.
+	// Keep the one allowed connection slot open. A PING round-trip
+	// proves the server's Accept loop has already registered this
+	// connection's slot before we dial the second connection: dialing
+	// on a fixed sleep is not enough, since a busy CI runner can delay
+	// the Accept loop past any fixed delay, letting the second dial
+	// win the single slot and hang until the idle timeout instead of
+	// being rejected.
 	holder, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("net.Dial (holder): %v", err)
 	}
 	defer func() { _ = holder.Close() }()
 
-	// Wait a short time for the server to record the connection.
-	time.Sleep(50 * time.Millisecond)
+	holderW := resp.NewWriter(holder)
+	holderR := resp.NewReader(holder)
+	if err := holderW.Write(resp.NewArray([]resp.Value{resp.NewBulkString("PING")})); err != nil {
+		t.Fatalf("write PING (holder): %v", err)
+	}
+	if _, err := holderR.Read(); err != nil {
+		t.Fatalf("read PING reply (holder): %v", err)
+	}
 
 	rejected, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -173,6 +185,11 @@ func TestServerRejectsConnectionsOverMaxConnections(t *testing.T) {
 	}
 	defer func() { _ = rejected.Close() }()
 
+	// A deadline turns any unexpected server behavior into a fast,
+	// clear failure instead of a hang up to the idle timeout.
+	if err := rejected.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
 	r := resp.NewReader(rejected)
 	reply, err := r.Read()
 	if err != nil {
